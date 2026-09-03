@@ -109,6 +109,16 @@ fake source generator with a real web search call. Everything else should
 be unaffected, since the A2A contract (Agent Card + task/artifact shape)
 doesn't change.
 
+**Status:** Implemented via a swappable `SearchProvider` adapter
+(`agents/lit_search/search_provider.py`), with `FakeSearchProvider` (default)
+and `TavilySearchProvider`, selected by `LIT_SEARCH_PROVIDER=fake|tavily`.
+Live Tavily API verification not completed in this session due to
+sandboxed egress restrictions (api.tavily.com not reachable). Provider
+adapter logic verified via stub success/error-mode tests; failure-handling
+path additionally verified against a genuine live network failure in this
+session. Outstanding: a real-key smoke test against the live Tavily API to
+confirm response-shape parsing, to be run outside this sandbox.
+
 ## Definition of done for each step
 
 - Agent Card is fetchable and schema-valid.

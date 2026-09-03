@@ -1,7 +1,12 @@
 """AgentExecutor for the lit_search agent.
 
-Step 1 of the SPEC: prove the A2A streaming/task/artifact mechanics work
-end-to-end with fake data. No real web search yet (that's Step 5).
+Streams sources for the `find-sources` skill via a pluggable
+SearchProvider (agents/lit_search/search_provider.py) — the fake
+generator from Step 1, or real web search as of Step 5. The streaming/
+task logic here doesn't know or care which provider is behind it, and
+the A2A contract (Agent Card, artifact shape, event sequencing) is
+identical either way: one TaskArtifactUpdateEvent per source, ending
+with last_chunk=True and task state completed.
 """
 
 from __future__ import annotations
@@ -14,54 +19,30 @@ from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 from a2a.server.tasks import TaskUpdater
 from a2a.types import DataPart, Part, UnsupportedOperationError
-from a2a.utils import new_task
+from a2a.utils import new_agent_text_message, new_task
 from a2a.utils.errors import ServerError
+
+from agents.lit_search.search_provider import (
+    DEFAULT_MAX_RESULTS,
+    SearchProvider,
+    SearchProviderError,
+)
 
 logger = logging.getLogger(__name__)
 
 # TODO(v1): no auth/security hardening yet — see SPEC.md.
 
-# Fake source generator standing in for a real web search (Step 5).
-FAKE_SOURCES = [
-    {
-        "title": "Attention Is All You Need",
-        "url": "https://arxiv.org/abs/1706.03762",
-        "snippet": (
-            "Introduces the Transformer architecture, replacing recurrence "
-            "and convolutions with self-attention."
-        ),
-    },
-    {
-        "title": "Deep Residual Learning for Image Recognition",
-        "url": "https://arxiv.org/abs/1512.03385",
-        "snippet": (
-            "Proposes residual connections that make very deep "
-            "convolutional networks trainable."
-        ),
-    },
-    {
-        "title": "Language Models are Few-Shot Learners",
-        "url": "https://arxiv.org/abs/2005.14165",
-        "snippet": (
-            "Shows that scaling autoregressive language models yields "
-            "strong few-shot task performance without fine-tuning."
-        ),
-    },
-    {
-        "title": "A Survey of Large Language Models",
-        "url": "https://arxiv.org/abs/2303.18223",
-        "snippet": (
-            "Surveys the recent development of large language models, "
-            "covering pre-training, adaptation, and evaluation."
-        ),
-    },
-]
-
 SLEEP_BETWEEN_SOURCES_SECONDS = 0.5
 
 
 class LitSearchAgentExecutor(AgentExecutor):
-    """Streams a handful of fake sources for the `find-sources` skill."""
+    """Streams search results for the `find-sources` skill."""
+
+    def __init__(
+        self, provider: SearchProvider, max_results: int = DEFAULT_MAX_RESULTS
+    ) -> None:
+        self._provider = provider
+        self._max_results = max_results
 
     async def execute(
         self, context: RequestContext, event_queue: EventQueue
@@ -74,12 +55,33 @@ class LitSearchAgentExecutor(AgentExecutor):
         updater = TaskUpdater(event_queue, task.id, task.context_id)
         await updater.start_work()
 
-        topic = context.get_user_input() or "(no topic given)"
-        logger.info("lit_search: searching for %r", topic)
+        topic = context.get_user_input().strip()
+        if not topic:
+            await updater.failed(
+                message=new_agent_text_message(
+                    "No search topic was provided.", task.context_id, task.id
+                )
+            )
+            return
 
+        logger.info("lit_search: searching for %r", topic)
+        try:
+            sources = await self._provider.search(topic, self._max_results)
+        except SearchProviderError as exc:
+            logger.error("lit_search: search failed: %s", exc)
+            await updater.failed(
+                message=new_agent_text_message(
+                    f"Search failed: {exc}", task.context_id, task.id
+                )
+            )
+            return
+
+        # Stream results out one at a time regardless of whether the
+        # provider returned them incrementally or as one batch — this is
+        # what keeps the streaming contract identical across providers.
         artifact_id = str(uuid4())
-        last_index = len(FAKE_SOURCES) - 1
-        for index, source in enumerate(FAKE_SOURCES):
+        last_index = len(sources) - 1
+        for index, source in enumerate(sources):
             await asyncio.sleep(SLEEP_BETWEEN_SOURCES_SECONDS)
             await updater.add_artifact(
                 parts=[Part(root=DataPart(data=source))],
