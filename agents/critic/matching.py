@@ -12,6 +12,15 @@ from common.text import split_sentences, tokenize
 
 SUPPORT_THRESHOLD = 0.4
 
+# Crude content-hygiene filter, not real claim extraction: the naive
+# ". "/"! "/"? " sentence splitter above treats bare numbered-list markers
+# and stray fragments ("1.", "2.", "FromFlow") pulled in from scraped
+# snippets as if they were claims, which is nonsense to run a keyword-
+# overlap check against. Dropping anything under ~4 words before scoring
+# clears that out. Messier drafts will still let some fragments through;
+# that's an accepted v1 limitation, not something to chase further now.
+MIN_CLAIM_WORDS = 4
+
 
 def verify_claim(claim: str, sources: list[dict]) -> dict:
     """Scores a single claim sentence against every source, keeping the best match."""
@@ -44,4 +53,5 @@ def verify_claim(claim: str, sources: list[dict]) -> dict:
 
 def verify_claims(draft: str, sources: list[dict]) -> list[dict]:
     """Splits a drafted answer into claim sentences and verifies each one."""
-    return [verify_claim(claim, sources) for claim in split_sentences(draft)]
+    claims = [c for c in split_sentences(draft) if len(c.split()) >= MIN_CLAIM_WORDS]
+    return [verify_claim(claim, sources) for claim in claims]

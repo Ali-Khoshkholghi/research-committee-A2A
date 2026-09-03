@@ -16,6 +16,65 @@ MIN_SOURCES = 2
 POSITIVE_KEYWORDS = {"increases", "supports", "confirms"}
 NEGATIVE_KEYWORDS = {"decreases", "refutes", "contradicts"}
 
+# --- crude content-hygiene filtering for snippets going into the draft ---
+#
+# Real search results (e.g. Tavily) come back as scraped page text, not
+# clean sentences: markdown headers, nav/ad boilerplate, and bare
+# numbered-list markers ("1.", "2.") show up as lines in the snippet. None
+# of that is a claim or a sentence, so it shouldn't be woven into the
+# templated draft. This is NOT real content extraction — just enough
+# line-level filtering to keep obvious junk out before it hits the naive
+# templating below, which was only ever designed for clean fake snippets.
+# Messier pages will still let some noise through; that's an accepted v1
+# limitation, not something to chase further right now.
+_MIN_SNIPPET_LINE_WORDS = 4
+
+_AD_KEYWORDS = (
+    "no-code", "sign up", "sign in", "log in", "get started", "learn more",
+    "subscribe", "pricing", "free trial", "book a demo", "contact us",
+    "shop now", "buy now", "add to cart",
+)
+
+# A line with none of these is probably a brand/product name or nav label,
+# not a sentence — even if it's long enough to pass the word-count check.
+_COMMON_VERBS = {
+    "is", "are", "was", "were", "be", "been", "has", "have", "had",
+    "does", "do", "did", "shows", "show", "proposes", "introduces",
+    "provides", "offers", "presents", "demonstrates", "uses", "makes",
+    "notes", "states", "yields", "covers", "surveys", "increases",
+    "decreases", "refutes", "confirms", "supports", "contradicts",
+    "replacing", "replaces", "helps", "enables", "allows", "requires",
+    "includes", "describes", "explains", "finds", "reports", "suggests",
+    "argues", "claims", "means", "focuses", "aims", "seeks", "improves",
+    "reduces", "achieves", "outperforms", "trains", "trained",
+}
+
+
+def _is_junk_line(line: str) -> bool:
+    """True if `line` looks like markdown/nav/ad noise rather than prose."""
+    stripped = line.strip()
+    if not stripped:
+        return True
+    if stripped.startswith("#"):
+        return True
+    words = stripped.split()
+    if len(words) < _MIN_SNIPPET_LINE_WORDS:
+        return True
+    lowered = stripped.lower()
+    if any(keyword in lowered for keyword in _AD_KEYWORDS):
+        return True
+    if not any(re.sub(r"[^a-z]", "", w.lower()) in _COMMON_VERBS for w in words):
+        return True
+    return False
+
+
+def clean_snippet(snippet: str) -> str:
+    """Strips junk lines (headers, fragments, ad copy) out of a snippet
+    before it's included in the draft. See `_is_junk_line` above."""
+    lines = [line for line in snippet.splitlines() if not _is_junk_line(line)]
+    return " ".join(line.strip() for line in lines)
+
+
 # Opposite sentiment keywords alone are a weak signal — two sources on
 # unrelated topics can each contain one by coincidence (e.g. "increases"
 # describing solar panel efficiency, "decreases" describing recycling
@@ -116,12 +175,13 @@ def build_draft(
         others = [s for i, s in enumerate(sources) if i != prioritized_index]
         sentences = [
             f'Regarding {topic}, the strongest evidence comes from '
-            f'"{primary.get("title", "?")}", which notes: {primary.get("snippet", "")}'
+            f'"{primary.get("title", "?")}", which notes: '
+            f'{clean_snippet(primary.get("snippet", ""))}'
         ]
         for source in others:
             sentences.append(
                 f'"{source.get("title", "?")}" adds further context: '
-                f'{source.get("snippet", "")}'
+                f'{clean_snippet(source.get("snippet", ""))}'
             )
         return " ".join(sentences)
 
@@ -129,7 +189,8 @@ def build_draft(
         sentences = [f"Sources disagree on {topic}."]
         for source in sources:
             sentences.append(
-                f'"{source.get("title", "?")}" states: {source.get("snippet", "")}'
+                f'"{source.get("title", "?")}" states: '
+                f'{clean_snippet(source.get("snippet", ""))}'
             )
         sentences.append(
             "Both perspectives are presented here without a single resolution."
@@ -138,6 +199,9 @@ def build_draft(
 
     sentences = [f"Regarding {topic}, several sources offer relevant perspectives."]
     for source in sources:
-        sentences.append(f'"{source.get("title", "?")}" notes: {source.get("snippet", "")}')
+        sentences.append(
+            f'"{source.get("title", "?")}" notes: '
+            f'{clean_snippet(source.get("snippet", ""))}'
+        )
     sentences.append(f"Taken together, these sources sketch an initial picture of {topic}.")
     return " ".join(sentences)
