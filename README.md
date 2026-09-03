@@ -4,7 +4,10 @@
 
 A small multi-agent research assistant — a "committee of agents" — built to
 learn the **A2A (Agent2Agent) protocol** properly, end-to-end, rather than
-just reading about it.
+just reading about it. It's a portfolio/learning repo, not a production
+service: the goal is a correct, minimal demonstration of Agent Cards, the
+A2A task lifecycle, JSON-RPC+SSE streaming, and multi-hop `input-required`
+pause/resume — not feature completeness or real answer quality.
 
 A human asks a research question. Four independent agents collaborate over
 A2A to answer it: `lit_search` finds sources, `synthesis` drafts an answer,
@@ -28,44 +31,14 @@ For the protocol itself — Agent Cards, Tasks, `message/stream`, artifacts,
 task states — see the spec: https://a2a-protocol.org. This README only
 covers how this repo uses it.
 
-## Architecture
-
-```
-                         human
-                           │
-                           │ message/stream ("research-question")
-                           ▼
-                   ┌───────────────┐
-                   │     chair     │  :9000
-                   │ (orchestrator)│
-                   └───┬───┬───┬───┘
-           ┌───────────┘   │   └───────────┐
-           ▼                ▼               ▼
-   ┌───────────────┐ ┌───────────────┐ ┌───────────────┐
-   │   lit_search   │ │   synthesis   │ │    critic     │
-   │     :9001      │ │     :9002     │ │     :9003     │
-   │ find-sources   │ │ draft-answer  │ │ verify-claims │
-   └────────────────┘ └───────────────┘ └───────────────┘
-```
-
-Request flow for one research question:
-
-1. `chair` receives the question from the human and generates one
-   `contextId` for the whole exchange.
-2. `chair` calls `lit_search` (streamed), relaying each found source
-   upward as its own status updates.
-3. `chair` feeds the collected sources into `synthesis` (streamed),
-   relaying each drafted chunk upward the same way.
-4. `chair` feeds the finished draft + sources into `critic` (single call).
-5. `chair` returns one final artifact: the answer plus `critic`'s verdicts.
-
-Every one of those four calls is a **separate A2A Task** — a
-`lit_search` task, a `synthesis` task, a `critic` task, and `chair`'s own
-task to the human — but they all carry the same `contextId`, so the whole
-exchange is traceable as one logical conversation even though there's no
-single shared Task spanning it.
-
 ## The agents
+
+| Agent | Port | Skill (Agent Card) | Streams? | Role |
+|---|---|---|---|---|
+| `lit_search` | 9001 | `find-sources` | yes — one source at a time | Finds candidate sources for a topic |
+| `synthesis` | 9002 | `draft-answer` | yes — text chunks | Drafts an answer from those sources |
+| `critic` | 9003 | `verify-claims` | no — single final artifact | Checks the draft's claims against the sources |
+| `chair` | 9000 | `research-question` | yes — relays committee progress | Orchestrates the other three; the only agent a human talks to |
 
 ### `lit_search` (9001)
 
@@ -124,6 +97,43 @@ question up to the human unmodified, and waits. When the human replies,
 sub-task (recovered from `chair`'s own `Task.metadata`, stashed there for
 exactly this purpose) to continue where it left off.
 
+## Architecture
+
+```
+                         human
+                           │
+                           │ message/stream ("research-question")
+                           ▼
+                   ┌───────────────┐
+                   │     chair     │  :9000
+                   │ (orchestrator)│
+                   └───┬───┬───┬───┘
+           ┌───────────┘   │   └───────────┐
+           ▼                ▼               ▼
+   ┌───────────────┐ ┌───────────────┐ ┌───────────────┐
+   │   lit_search   │ │   synthesis   │ │    critic     │
+   │     :9001      │ │     :9002     │ │     :9003     │
+   │ find-sources   │ │ draft-answer  │ │ verify-claims │
+   └────────────────┘ └───────────────┘ └───────────────┘
+```
+
+Request flow for one research question:
+
+1. `chair` receives the question from the human and generates one
+   `contextId` for the whole exchange.
+2. `chair` calls `lit_search` (streamed), relaying each found source
+   upward as its own status updates.
+3. `chair` feeds the collected sources into `synthesis` (streamed),
+   relaying each drafted chunk upward the same way.
+4. `chair` feeds the finished draft + sources into `critic` (single call).
+5. `chair` returns one final artifact: the answer plus `critic`'s verdicts.
+
+Every one of those four calls is a **separate A2A Task** — a
+`lit_search` task, a `synthesis` task, a `critic` task, and `chair`'s own
+task to the human — but they all carry the same `contextId`, so the whole
+exchange is traceable as one logical conversation even though there's no
+single shared Task spanning it.
+
 ## Why `input-required` matters
 
 Most tutorial-level A2A implementations skip `input-required` entirely —
@@ -144,8 +154,28 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Start the three sub-agents, then `chair` (it validates the other three at
-startup, so they need to be up first):
+### Configuration
+
+Copy `.env.example` to `.env` and fill it in:
+
+```bash
+cp .env.example .env
+```
+
+```
+TAVILY_API_KEY=
+LIT_SEARCH_PROVIDER=tavily
+```
+
+- `LIT_SEARCH_PROVIDER` — `fake` (default if unset) or `tavily`. `fake`
+  needs no key and is safe for repeated `debug_client.py` runs.
+- `TAVILY_API_KEY` — only required when `LIT_SEARCH_PROVIDER=tavily`. If
+  it's missing in that case, `lit_search` fails loudly at startup instead
+  of on the first search. `.env` is loaded automatically (`python-dotenv`)
+  by both `lit_search` and `chair`; you can also just export the vars in
+  your shell instead of using a `.env` file.
+
+### Start the agents
 
 ```bash
 python -m agents.lit_search &
@@ -153,6 +183,11 @@ python -m agents.synthesis &
 python -m agents.critic &
 python -m chair &
 ```
+
+`chair` validates the other three Agent Cards at startup, so they need to
+be up first.
+
+### Drive it with `debug_client.py`
 
 Fetch an Agent Card directly:
 
@@ -167,43 +202,49 @@ python -m common.debug_client --url http://localhost:9000 \
   --text "What does the evidence say about sleep and memory consolidation?"
 ```
 
+By default, `[STATUS]`/`[ARTIFACT]` output is truncated for readability.
+Add `--full` to print complete, untruncated field values instead —
+useful for actually inspecting `chair`'s final answer text or `critic`'s
+full verdict list rather than skimming a trace:
+
+```bash
+python -m common.debug_client --url http://localhost:9000 \
+  --text "A2A protocol adversarial robustness" --full
+```
+
 `debug_client.py` also supports DataPart payloads (`--data`/`--data-file`,
 for hitting `synthesis`/`critic` directly) and replying to a paused task
 (`--task-id`/`--context-id`) — see its own `--help` and docstring.
 
-### Fake vs. live search
-
-`lit_search` defaults to `FakeSearchProvider` — no key needed, safe for
-repeated `debug_client.py` runs. To use real search:
-
-```bash
-LIT_SEARCH_PROVIDER=tavily TAVILY_API_KEY=<your key> python -m agents.lit_search
-```
-
-`TAVILY_API_KEY` is read from the environment only — never hardcoded, and
-if `LIT_SEARCH_PROVIDER=tavily` is set without a key, `lit_search` fails
-loudly at startup instead of on the first search.
-
 ## Current limitations / known TODOs
 
+Stated plainly, since this is meant to be read, not buried:
+
+- **`synthesis` is a naive templater, not an LLM.** It concatenates source
+  snippets into a fixed sentence template, with a crude content-hygiene
+  pass (stripping markdown headers, ad/nav boilerplate, and search-API
+  truncation artifacts like Tavily's `[...]` marker) and a per-source
+  length cap — not real summarization or paraphrasing. See
+  `agents/synthesis/drafting.py`.
+- **`critic` can't structurally produce `supported: False` against
+  `synthesis`'s output.** Because `synthesis` quotes source snippets
+  near-verbatim, and `critic` scores a claim as the *best* keyword-overlap
+  match against any source (including the one it was quoted from), an
+  honestly-echoed claim will always clear `SUPPORT_THRESHOLD`. The
+  request/response pipeline is real; the fact-checking behind it is not —
+  see `agents/critic/matching.py`.
+- **`SUPPORT_THRESHOLD` and `TOPIC_RELATEDNESS_THRESHOLD` are empirically
+  tuned on a small sample**, not rigorously validated — reasonable
+  starting points, not numbers to trust blindly.
 - **No auth or Agent Card signature verification** — flagged as a `v1`
   TODO in every agent's executor. Fine for localhost; not for anything
-  beyond it.
-- **`critic`'s matching is naive keyword overlap**, not real NLP or an
-  LLM call — explicitly a placeholder (see `agents/critic/matching.py`).
-- **Live Tavily response-shape verification is outstanding.** The
-  provider adapter's request/response/error handling was verified
-  against a stub server and one genuine live network failure, but a
-  real-key smoke test against the live Tavily API hasn't been run in
-  this repo's development sandbox (egress was restricted there) — see
-  `SPEC.md`'s Step 5 section for the details.
+  beyond it. Explicitly out of scope for `v1` (see `SPEC.md`).
 - **Localhost-only, no persistent storage, no multi-tenancy, no
-  gRPC/REST bindings** — all explicitly out of scope for `v1` (see
-  `SPEC.md`).
+  gRPC/REST bindings** — also explicitly out of scope for `v1`.
 
 ## Build history
 
 `SPEC.md` is the original design doc this was built from, step by step
 (fake `lit_search` → debug client → `synthesis`/`critic` → `chair` →
-real search). Worth reading if you want the reasoning behind each piece,
-not just the result.
+real search). Worth reading if you want the full build rationale, not
+just the result.
