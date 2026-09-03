@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 
-from common.text import tokenize
+from common.text import split_sentences, tokenize
 
 MIN_SOURCES = 2
 
@@ -50,6 +50,16 @@ _COMMON_VERBS = {
 }
 
 
+# Tavily marks its own mid-scrape truncation with a literal "[...]" and
+# sometimes glues the next section's markdown header onto the tail of the
+# same physical line rather than giving it its own line — so the header
+# check above (line-start only) misses it. Both are Tavily/scrape
+# artifacts, never real content, so they're stripped outright rather than
+# just used to decide whether to keep the line.
+_ELLIPSIS_RE = re.compile(r"\s*\[\.\.\.\]\s*")
+_HEADER_FRAGMENT_RE = re.compile(r"#{1,6}\s.*")
+
+
 def _is_junk_line(line: str) -> bool:
     """True if `line` looks like markdown/nav/ad noise rather than prose."""
     stripped = line.strip()
@@ -71,8 +81,42 @@ def _is_junk_line(line: str) -> bool:
 def clean_snippet(snippet: str) -> str:
     """Strips junk lines (headers, fragments, ad copy) out of a snippet
     before it's included in the draft. See `_is_junk_line` above."""
-    lines = [line for line in snippet.splitlines() if not _is_junk_line(line)]
-    return " ".join(line.strip() for line in lines)
+    lines = []
+    for raw_line in snippet.splitlines():
+        # Strip Tavily's own truncation marker first, then any header
+        # fragment it may have left glued to what remains — order matters,
+        # since a header can end up starting right where "[...] " used to be.
+        line = _ELLIPSIS_RE.sub(" ", raw_line)
+        line = _HEADER_FRAGMENT_RE.sub("", line)
+        if not _is_junk_line(line):
+            lines.append(" ".join(line.split()))
+    return " ".join(lines)
+
+
+# Crude per-source length cap, not real summarization — same "naive by
+# design" framing as the rest of this module. Without it, synthesis pulls
+# in nearly the full cleaned snippet from every source, producing a long
+# near-verbatim dump rather than anything resembling a synthesized answer.
+# Sentences are the primary cap; the character cap is just a safety net
+# for one long run-on fragment with no nearby "."/"!"/"?" for the naive
+# sentence splitter to find.
+MAX_SNIPPET_SENTENCES = 2
+MAX_SNIPPET_CHARS = 250
+
+
+def _cap_snippet(text: str) -> str:
+    """Takes at most the first MAX_SNIPPET_SENTENCES sentences of an
+    already-cleaned snippet, then hard-caps the result to
+    MAX_SNIPPET_CHARS characters (truncated at a word boundary)."""
+    capped = " ".join(split_sentences(text)[:MAX_SNIPPET_SENTENCES])
+    if len(capped) <= MAX_SNIPPET_CHARS:
+        return capped
+    return capped[:MAX_SNIPPET_CHARS].rsplit(" ", 1)[0] + "…"
+
+
+def _draft_snippet(source: dict) -> str:
+    """Cleans and length-caps a source's snippet for use in the draft."""
+    return _cap_snippet(clean_snippet(source.get("snippet", "")))
 
 
 # Opposite sentiment keywords alone are a weak signal — two sources on
@@ -176,12 +220,12 @@ def build_draft(
         sentences = [
             f'Regarding {topic}, the strongest evidence comes from '
             f'"{primary.get("title", "?")}", which notes: '
-            f'{clean_snippet(primary.get("snippet", ""))}'
+            f'{_draft_snippet(primary)}'
         ]
         for source in others:
             sentences.append(
                 f'"{source.get("title", "?")}" adds further context: '
-                f'{clean_snippet(source.get("snippet", ""))}'
+                f'{_draft_snippet(source)}'
             )
         return " ".join(sentences)
 
@@ -190,7 +234,7 @@ def build_draft(
         for source in sources:
             sentences.append(
                 f'"{source.get("title", "?")}" states: '
-                f'{clean_snippet(source.get("snippet", ""))}'
+                f'{_draft_snippet(source)}'
             )
         sentences.append(
             "Both perspectives are presented here without a single resolution."
@@ -201,7 +245,7 @@ def build_draft(
     for source in sources:
         sentences.append(
             f'"{source.get("title", "?")}" notes: '
-            f'{clean_snippet(source.get("snippet", ""))}'
+            f'{_draft_snippet(source)}'
         )
     sentences.append(f"Taken together, these sources sketch an initial picture of {topic}.")
     return " ".join(sentences)
