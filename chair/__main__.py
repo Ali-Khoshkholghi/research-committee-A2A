@@ -22,11 +22,16 @@ from a2a.server.apps import A2AStarletteApplication
 from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.server.tasks import InMemoryTaskStore
 from a2a.types import AgentCard
+from dotenv import load_dotenv
 
 from chair.agent_card import PORT, build_agent_card
 from chair.agent_executor import ChairAgentExecutor
 from chair.client import SubAgentSpec, SubAgentUnavailableError, discover_all
 from common.logging_config import configure_logging
+
+# Loaded before SUB_AGENT_SPECS below, since those env vars (and any future
+# config vars added here) are read at import time, not inside main().
+load_dotenv()
 
 HOST = "0.0.0.0"
 

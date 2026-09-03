@@ -11,11 +11,14 @@ import uvicorn
 from a2a.server.apps import A2AStarletteApplication
 from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.server.tasks import InMemoryTaskStore
+from dotenv import load_dotenv
 
 from agents.lit_search.agent_card import PORT, build_agent_card
 from agents.lit_search.agent_executor import LitSearchAgentExecutor
 from agents.lit_search.search_provider import SearchProviderConfigError, build_provider
 from common.logging_config import configure_logging
+
+load_dotenv()
 
 HOST = "0.0.0.0"
 
