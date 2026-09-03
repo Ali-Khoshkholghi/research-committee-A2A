@@ -16,11 +16,23 @@ MIN_SOURCES = 2
 POSITIVE_KEYWORDS = {"increases", "supports", "confirms"}
 NEGATIVE_KEYWORDS = {"decreases", "refutes", "contradicts"}
 
+# Opposite sentiment keywords alone are a weak signal — two sources on
+# unrelated topics can each contain one by coincidence (e.g. "increases"
+# describing solar panel efficiency, "decreases" describing recycling
+# costs). Only treat it as a real disagreement if the sources also share
+# enough topic vocabulary to plausibly be about the same thing. 0.15 was
+# picked empirically: an unrelated pair scored ~0.08 overlap, a genuine
+# same-topic disagreement scored ~0.20 — this sits between the two.
+TOPIC_RELATEDNESS_THRESHOLD = 0.15
+
 _SOURCE_INDEX_RE = re.compile(r"source\s*(\d+)", re.IGNORECASE)
 
 
-def _source_sentiment(source: dict) -> str | None:
-    tokens = tokenize(f"{source.get('title', '')} {source.get('snippet', '')}")
+def _source_tokens(source: dict) -> set[str]:
+    return tokenize(f"{source.get('title', '')} {source.get('snippet', '')}")
+
+
+def _sentiment(tokens: set[str]) -> str | None:
     if tokens & POSITIVE_KEYWORDS:
         return "positive"
     if tokens & NEGATIVE_KEYWORDS:
@@ -28,14 +40,27 @@ def _source_sentiment(source: dict) -> str | None:
     return None
 
 
+def _topic_overlap_ratio(tokens_i: set[str], tokens_j: set[str]) -> float:
+    """Containment-style overlap between two sources' non-sentiment tokens."""
+    topic_i = tokens_i - POSITIVE_KEYWORDS - NEGATIVE_KEYWORDS
+    topic_j = tokens_j - POSITIVE_KEYWORDS - NEGATIVE_KEYWORDS
+    if not topic_i or not topic_j:
+        return 0.0
+    return len(topic_i & topic_j) / min(len(topic_i), len(topic_j))
+
+
 def find_contradiction(sources: list[dict]) -> tuple[int, int] | None:
     """Returns the (i, j) indices of the first pair of sources with opposite
-    sentiment keywords, or None if no such pair exists."""
-    sentiments = [_source_sentiment(s) for s in sources]
+    sentiment keywords AND enough shared topic vocabulary to plausibly be
+    about the same thing, or None if no such pair exists."""
+    token_sets = [_source_tokens(s) for s in sources]
+    sentiments = [_sentiment(t) for t in token_sets]
     for i in range(len(sentiments)):
         for j in range(i + 1, len(sentiments)):
             if sentiments[i] and sentiments[j] and sentiments[i] != sentiments[j]:
-                return i, j
+                ratio = _topic_overlap_ratio(token_sets[i], token_sets[j])
+                if ratio >= TOPIC_RELATEDNESS_THRESHOLD:
+                    return i, j
     return None
 
 
