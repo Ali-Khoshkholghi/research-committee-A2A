@@ -4,7 +4,15 @@ from __future__ import annotations
 
 from typing import Any
 
-from a2a.types import DataPart, Message
+from a2a.types import DataPart, Message, TextPart
+
+
+def message_text(message: Message | None) -> str:
+    """Joins the text of all TextParts in a Message."""
+    if message is None:
+        return ""
+    texts = [part.root.text for part in message.parts if isinstance(part.root, TextPart)]
+    return " ".join(t for t in texts if t)
 
 
 def get_data_part(message: Message | None) -> dict[str, Any] | None:
