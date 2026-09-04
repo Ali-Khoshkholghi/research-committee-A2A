@@ -1,10 +1,17 @@
 """AgentExecutor for the synthesis agent.
 
-Step 3 of the SPEC. Streams a fake, templated draft answer sentence-by-
-sentence as TextPart chunks (append/last_chunk semantics). Also implements
-input-required for real: pauses when the sources look too thin or
-contradictory, then resumes from the caller's follow-up reply — the first
-agent in this repo to do a full input-required round trip.
+Streams a drafted answer for the `draft-answer` skill via a pluggable
+SynthesisProvider (agents/synthesis/llm_provider.py) — the naive
+templater from Step 3, or a real Gemini call as of Step 6. The
+streaming/task logic here doesn't know or care which provider is behind
+it: it consumes whatever text chunks the provider yields and streams
+them out as TextPart artifacts with the same append/last_chunk
+semantics either way.
+
+Also implements input-required for real: pauses when the sources look
+too thin or contradictory (this check runs before any provider is
+called, regardless of which one is selected), then resumes from the
+caller's follow-up reply.
 """
 
 from __future__ import annotations
@@ -20,13 +27,9 @@ from a2a.types import Part, Task, TaskState, TextPart, UnsupportedOperationError
 from a2a.utils import new_agent_text_message, new_task
 from a2a.utils.errors import ServerError
 
-from agents.synthesis.drafting import (
-    ambiguity_prompt,
-    build_draft,
-    parse_prioritized_index,
-)
+from agents.synthesis.drafting import ambiguity_prompt
+from agents.synthesis.llm_provider import SynthesisProvider, SynthesisProviderError
 from common.parts import find_data_part_in_history, get_data_part
-from common.text import split_sentences
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +39,10 @@ SLEEP_BETWEEN_CHUNKS_SECONDS = 0.1
 
 
 class SynthesisAgentExecutor(AgentExecutor):
-    """Drafts a fake answer paragraph from a topic + sources, streaming it out."""
+    """Drafts an answer paragraph from a topic + sources, streaming it out."""
+
+    def __init__(self, provider: SynthesisProvider) -> None:
+        self._provider = provider
 
     async def execute(
         self, context: RequestContext, event_queue: EventQueue
@@ -73,7 +79,11 @@ class SynthesisAgentExecutor(AgentExecutor):
             return
 
         await updater.start_work()
-        await self._draft_and_stream(updater, topic, sources)
+        try:
+            await self._draft_and_stream(updater, task, topic, sources)
+        except SynthesisProviderError as exc:
+            await self._fail(updater, task, exc)
+            return
         await updater.complete()
 
     async def _resume(
@@ -85,55 +95,73 @@ class SynthesisAgentExecutor(AgentExecutor):
         topic = payload.get("topic", "")
         sources = payload.get("sources", [])
         guidance = context.get_user_input().strip()
-
-        prioritized_index = parse_prioritized_index(guidance, sources)
-        present_both = prioritized_index is None and "both" in guidance.lower()
-        logger.info(
-            "synthesis: resuming task %s with guidance=%r "
-            "(prioritized_index=%s, present_both=%s)",
-            task.id,
-            guidance,
-            prioritized_index,
-            present_both,
-        )
+        logger.info("synthesis: resuming task %s with guidance=%r", task.id, guidance)
 
         await updater.start_work()
-        await self._draft_and_stream(
-            updater,
-            topic,
-            sources,
-            prioritized_index=prioritized_index,
-            present_both=present_both,
-        )
+        try:
+            await self._draft_and_stream(updater, task, topic, sources, guidance=guidance)
+        except SynthesisProviderError as exc:
+            await self._fail(updater, task, exc)
+            return
         await updater.complete()
 
     async def _draft_and_stream(
         self,
         updater: TaskUpdater,
+        task: Task,
         topic: str,
         sources: list[dict],
-        prioritized_index: int | None = None,
-        present_both: bool = False,
+        guidance: str | None = None,
     ) -> None:
-        draft = build_draft(
-            topic,
-            sources,
-            prioritized_index=prioritized_index,
-            present_both=present_both,
-        )
-        sentences = split_sentences(draft)
+        """Streams the provider's chunks out as TextPart artifacts.
+
+        The provider yields chunks lazily and we don't know which one is
+        last until the iterator is exhausted, so this buffers one chunk
+        ahead to set last_chunk correctly on the true final event.
+        """
         artifact_id = str(uuid4())
-        last_index = len(sentences) - 1
-        for index, sentence in enumerate(sentences):
+        chunks = self._provider.draft(topic, sources, guidance).__aiter__()
+
+        try:
+            current = await chunks.__anext__()
+        except StopAsyncIteration as exc:
+            raise SynthesisProviderError("provider returned no text") from exc
+
+        index = 0
+        while True:
+            try:
+                next_chunk = await chunks.__anext__()
+            except StopAsyncIteration:
+                await asyncio.sleep(SLEEP_BETWEEN_CHUNKS_SECONDS)
+                await updater.add_artifact(
+                    parts=[Part(root=TextPart(text=current))],
+                    artifact_id=artifact_id,
+                    name="draft",
+                    append=index > 0,
+                    last_chunk=True,
+                )
+                return
+
             await asyncio.sleep(SLEEP_BETWEEN_CHUNKS_SECONDS)
-            chunk_text = sentence if index == 0 else f" {sentence}"
             await updater.add_artifact(
-                parts=[Part(root=TextPart(text=chunk_text))],
+                parts=[Part(root=TextPart(text=current))],
                 artifact_id=artifact_id,
                 name="draft",
                 append=index > 0,
-                last_chunk=index == last_index,
+                last_chunk=False,
             )
+            current = next_chunk
+            index += 1
+
+    async def _fail(
+        self, updater: TaskUpdater, task: Task, exc: SynthesisProviderError
+    ) -> None:
+        logger.error("synthesis: %s", exc)
+        await updater.failed(
+            message=new_agent_text_message(
+                f"Draft failed: {exc}", task.context_id, task.id
+            )
+        )
 
     async def cancel(
         self, context: RequestContext, event_queue: EventQueue

@@ -15,6 +15,10 @@ Usage:
     # Continuing a paused (input-required) task with a follow-up reply:
     python -m common.debug_client --url http://localhost:9002 --text "prioritize source 0" \\
         --task-id <id> --context-id <id>
+
+    # Disable preview truncation to inspect a full drafted answer, verdict
+    # list, etc.:
+    python -m common.debug_client --url http://localhost:9002 --data-file payload.json --full
 """
 
 from __future__ import annotations
@@ -32,6 +36,9 @@ import httpx
 TERMINAL_STATES = {"completed", "failed", "canceled"}
 PREVIEW_MAX_LEN = 300
 _NESTED_VALUE_MAX_LEN = 60
+
+# Set from --full in main(); disables preview truncation everywhere below.
+FULL_OUTPUT = False
 
 
 def elapsed(t0: float) -> str:
@@ -60,7 +67,7 @@ def format_value(value: Any, max_len: int = _NESTED_VALUE_MAX_LEN) -> str:
     if isinstance(value, list):
         return "[" + "; ".join(format_value(v) for v in value) + "]"
     text = str(value)
-    if len(text) > max_len:
+    if not FULL_OUTPUT and len(text) > max_len:
         text = text[: max_len - 1] + "…"
     return text
 
@@ -83,7 +90,7 @@ def preview_part(part: dict[str, Any]) -> str:
         content = str(part)
 
     content = " ".join(content.split())
-    if len(content) > PREVIEW_MAX_LEN:
+    if not FULL_OUTPUT and len(content) > PREVIEW_MAX_LEN:
         content = content[: PREVIEW_MAX_LEN - 1] + "…"
     return content
 
@@ -140,7 +147,10 @@ def handle_envelope(data: dict[str, Any], t0: float) -> bool:
         print(f"[{elapsed(t0)}] [MESSAGE] {text}")
         return True
 
-    print(f"[{elapsed(t0)}] [OTHER] {json.dumps(result)[:PREVIEW_MAX_LEN]}")
+    dumped = json.dumps(result)
+    if not FULL_OUTPUT:
+        dumped = dumped[:PREVIEW_MAX_LEN]
+    print(f"[{elapsed(t0)}] [OTHER] {dumped}")
     return False
 
 
@@ -245,7 +255,15 @@ def main() -> None:
         help="Continue an existing task (e.g. replying to an input-required prompt)",
     )
     parser.add_argument("--context-id", help="Context ID to attach to the message")
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Disable preview truncation — print full Part/artifact content",
+    )
     args = parser.parse_args()
+
+    global FULL_OUTPUT
+    FULL_OUTPUT = args.full
 
     message = build_message(args)
     try:
