@@ -59,6 +59,20 @@ Streams a drafted answer as incremental `TextPart` chunks (`append=true`,
 final chunk `lastChunk=true`) rather than returning the whole draft at
 once.
 
+Drafting sits behind a swappable `SynthesisProvider` adapter
+(`agents/synthesis/llm_provider.py`), the same pattern as `lit_search`'s
+search provider: `FakeSynthesisProvider` (default, deterministic
+templater, no API key) or `GeminiSynthesisProvider` (real drafting via
+the Google Gemini API). The executor just streams whatever chunks the
+provider yields — it doesn't know or care which one is behind it.
+
+The Gemini model currently defaulted to (`gemini-3.6-flash`) does
+internal "thinking" before it emits any visible text, which adds real,
+noticeable latency: expect roughly 20–35 seconds before the *first*
+streamed chunk arrives, even for a short prompt. That's normal, not a
+hang — `debug_client.py`'s elapsed-time prefix will show it plainly.
+`FakeSynthesisProvider` has no such delay.
+
 It also implements a real `input-required` pause: before drafting, it
 checks whether the sources are too thin (`<2`) or contradictory (opposing
 sentiment keywords like "increases" vs. "decreases"). The contradiction
@@ -79,7 +93,14 @@ artifact with a per-claim verdict list, then `completed`. Claim
 verification is a deliberately naive keyword-overlap heuristic against a
 named `SUPPORT_THRESHOLD` constant — explicitly flagged in
 `agents/critic/matching.py` as a placeholder for real fact-checking, not
-a finished feature.
+a finished feature. It's intentionally left as-is even after `synthesis`
+started using a real LLM (see below): the point is to see a simple,
+fixed checker meaningfully catch drift in a real model's paraphrased
+output, rather than upgrading both sides together and losing that
+signal. In practice it does — a live run against Gemini-drafted output
+came back with a genuine mix of verdicts (10 `supported: true`, 1
+`supported: false` at ratio 0.33, below threshold, for a claim that was
+accurate but phrased too generally to keyword-match any single source).
 
 ### `chair` (9000)
 
@@ -165,15 +186,27 @@ cp .env.example .env
 ```
 TAVILY_API_KEY=
 LIT_SEARCH_PROVIDER=tavily
+
+GEMINI_API_KEY=
+SYNTHESIS_PROVIDER=gemini
+# GEMINI_MODEL=gemini-3.6-flash
 ```
 
 - `LIT_SEARCH_PROVIDER` — `fake` (default if unset) or `tavily`. `fake`
   needs no key and is safe for repeated `debug_client.py` runs.
 - `TAVILY_API_KEY` — only required when `LIT_SEARCH_PROVIDER=tavily`. If
   it's missing in that case, `lit_search` fails loudly at startup instead
-  of on the first search. `.env` is loaded automatically (`python-dotenv`)
-  by both `lit_search` and `chair`; you can also just export the vars in
-  your shell instead of using a `.env` file.
+  of on the first search.
+- `SYNTHESIS_PROVIDER` — `fake` (default if unset) or `gemini`. `fake`
+  needs no key and has no response latency.
+- `GEMINI_API_KEY` — only required when `SYNTHESIS_PROVIDER=gemini`, same
+  fail-loud-at-startup behavior if missing. `GEMINI_MODEL` is optional
+  (defaults to `gemini-3.6-flash`) — override it if that model is ever
+  retired; see the `synthesis` section above for the model's latency
+  characteristics.
+- `.env` is loaded automatically (`python-dotenv`) by `lit_search`,
+  `synthesis`, and `chair`; you can also just export the vars in your
+  shell instead of using a `.env` file.
 
 ### Start the agents
 
@@ -220,19 +253,25 @@ for hitting `synthesis`/`critic` directly) and replying to a paused task
 
 Stated plainly, since this is meant to be read, not buried:
 
-- **`synthesis` is a naive templater, not an LLM.** It concatenates source
-  snippets into a fixed sentence template, with a crude content-hygiene
-  pass (stripping markdown headers, ad/nav boilerplate, and search-API
-  truncation artifacts like Tavily's `[...]` marker) and a per-source
-  length cap — not real summarization or paraphrasing. See
-  `agents/synthesis/drafting.py`.
-- **`critic` can't structurally produce `supported: False` against
-  `synthesis`'s output.** Because `synthesis` quotes source snippets
-  near-verbatim, and `critic` scores a claim as the *best* keyword-overlap
-  match against any source (including the one it was quoted from), an
-  honestly-echoed claim will always clear `SUPPORT_THRESHOLD`. The
-  request/response pipeline is real; the fact-checking behind it is not —
-  see `agents/critic/matching.py`.
+- **`synthesis`'s default mode is a naive templater, not an LLM.** With no
+  `GEMINI_API_KEY` set (or `SYNTHESIS_PROVIDER=fake` explicitly),
+  `FakeSynthesisProvider` concatenates source snippets into a fixed
+  sentence template — not real summarization or paraphrasing. This is
+  deliberate (zero-setup, no key needed, no latency) rather than an
+  oversight; see `agents/synthesis/drafting.py`. With
+  `SYNTHESIS_PROVIDER=gemini` it's a real LLM call instead — see the
+  `synthesis` section above.
+- **`critic`'s naive keyword-overlap check has no real grounding
+  verification of its own.** It trusts that whatever `synthesis` sends it
+  is the actual draft, and scores each claim against the *best*-matching
+  source by shared vocabulary — nothing more sophisticated. Against the
+  fake templater's near-verbatim output, that overlap check is close to
+  trivial (an honestly-echoed sentence will essentially always clear
+  `SUPPORT_THRESHOLD`). Against real Gemini output it does meaningful
+  work purely as a side effect of the LLM paraphrasing in its own words:
+  a live run came back with a genuine mix (10 `supported: true`, 1
+  `supported: false`) — but that's `critic` catching *vocabulary drift*,
+  not verifying the claim is actually true. See `agents/critic/matching.py`.
 - **`SUPPORT_THRESHOLD` and `TOPIC_RELATEDNESS_THRESHOLD` are empirically
   tuned on a small sample**, not rigorously validated — reasonable
   starting points, not numbers to trust blindly.
@@ -246,5 +285,5 @@ Stated plainly, since this is meant to be read, not buried:
 
 `SPEC.md` is the original design doc this was built from, step by step
 (fake `lit_search` → debug client → `synthesis`/`critic` → `chair` →
-real search). Worth reading if you want the full build rationale, not
-just the result.
+real search → real `synthesis` LLM). Worth reading if you want the full
+build rationale, not just the result.
