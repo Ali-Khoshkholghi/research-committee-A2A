@@ -15,6 +15,10 @@ Usage:
     # Continuing a paused (input-required) task with a follow-up reply:
     python -m common.debug_client --url http://localhost:9002 --text "prioritize source 0" \\
         --task-id <id> --context-id <id>
+
+    # Disable preview truncation to inspect a full drafted answer, verdict
+    # list, etc.:
+    python -m common.debug_client --url http://localhost:9002 --data-file payload.json --full
 """
 
 from __future__ import annotations
@@ -32,6 +36,9 @@ import httpx
 TERMINAL_STATES = {"completed", "failed", "canceled"}
 PREVIEW_MAX_LEN = 300
 _NESTED_VALUE_MAX_LEN = 60
+
+# Set from --full in main(); disables preview truncation everywhere below.
+FULL_OUTPUT = False
 
 
 def elapsed(t0: float) -> str:
@@ -60,7 +67,7 @@ def format_value(value: Any, max_len: int = _NESTED_VALUE_MAX_LEN) -> str:
     if isinstance(value, list):
         return "[" + "; ".join(format_value(v) for v in value) + "]"
     text = str(value)
-    if len(text) > max_len:
+    if not FULL_OUTPUT and len(text) > max_len:
         text = text[: max_len - 1] + "…"
     return text
 
@@ -83,7 +90,7 @@ def preview_part(part: dict[str, Any]) -> str:
         content = str(part)
 
     content = " ".join(content.split())
-    if len(content) > PREVIEW_MAX_LEN:
+    if not FULL_OUTPUT and len(content) > PREVIEW_MAX_LEN:
         content = content[: PREVIEW_MAX_LEN - 1] + "…"
     return content
 
@@ -99,49 +106,19 @@ def print_status(
     print(f"[{elapsed(t0)}] [STATUS] {state}{text_suffix}{ids_suffix}")
 
 
-def render_part_full(part: dict[str, Any]) -> list[str]:
-    """Renders a part's complete content as one or more lines, with no
-    truncation. `verdicts` (chair's final artifact) gets one line per
-    verdict instead of being flattened into a single inline dump."""
-    kind = part.get("kind")
-    if kind == "text":
-        return [part.get("text", "")]
-    if kind == "data":
-        data = part.get("data", {})
-        if not isinstance(data, dict):
-            return [str(data)]
-        lines: list[str] = []
-        for key, value in data.items():
-            if key == "verdicts" and isinstance(value, list):
-                lines.append(f"{key} ({len(value)}):")
-                lines.extend(f"  [{i}] {verdict}" for i, verdict in enumerate(value))
-            else:
-                lines.append(f"{key}: {value}")
-        return lines
-    if kind == "file":
-        file_info = part.get("file", {})
-        return [file_info.get("name") or file_info.get("uri") or "<file>"]
-    return [str(part)]
-
-
-def print_artifact(t0: float, event: dict[str, Any], full: bool = False) -> None:
+def print_artifact(t0: float, event: dict[str, Any]) -> None:
     artifact = event.get("artifact", {})
     append = event.get("append", False)
     last_chunk = event.get("lastChunk", False)
-    header = f"[{elapsed(t0)}] [ARTIFACT] append={append} lastChunk={last_chunk}"
-
-    if not full:
-        previews = [preview_part(p) for p in artifact.get("parts", [])]
-        print(f"{header} {'; '.join(previews)}")
-        return
-
-    print(header)
-    for part in artifact.get("parts", []):
-        for line in render_part_full(part):
-            print(f"    {line}")
+    previews = [preview_part(p) for p in artifact.get("parts", [])]
+    preview = "; ".join(previews)
+    print(
+        f"[{elapsed(t0)}] [ARTIFACT] append={append} lastChunk={last_chunk} "
+        f"{preview}"
+    )
 
 
-def handle_envelope(data: dict[str, Any], t0: float, full: bool = False) -> bool:
+def handle_envelope(data: dict[str, Any], t0: float) -> bool:
     """Prints one JSON-RPC response/event. Returns True if the stream is done."""
     if "error" in data:
         print(f"[{elapsed(t0)}] [ERROR] {data['error']}")
@@ -162,7 +139,7 @@ def handle_envelope(data: dict[str, Any], t0: float, full: bool = False) -> bool
         return bool(result.get("final")) or state in TERMINAL_STATES
 
     if kind == "artifact-update":
-        print_artifact(t0, result, full)
+        print_artifact(t0, result)
         return False
 
     if kind == "message":
@@ -170,8 +147,10 @@ def handle_envelope(data: dict[str, Any], t0: float, full: bool = False) -> bool
         print(f"[{elapsed(t0)}] [MESSAGE] {text}")
         return True
 
-    content = json.dumps(result) if full else json.dumps(result)[:PREVIEW_MAX_LEN]
-    print(f"[{elapsed(t0)}] [OTHER] {content}")
+    dumped = json.dumps(result)
+    if not FULL_OUTPUT:
+        dumped = dumped[:PREVIEW_MAX_LEN]
+    print(f"[{elapsed(t0)}] [OTHER] {dumped}")
     return False
 
 
@@ -191,11 +170,7 @@ def print_agent_card_summary(card: dict[str, Any]) -> None:
 
 
 async def run_streaming(
-    client: httpx.AsyncClient,
-    rpc_url: str,
-    message: dict[str, Any],
-    t0: float,
-    full: bool = False,
+    client: httpx.AsyncClient, rpc_url: str, message: dict[str, Any], t0: float
 ) -> None:
     payload = {
         "jsonrpc": "2.0",
@@ -211,16 +186,12 @@ async def run_streaming(
             if not line.startswith("data:"):
                 continue
             data = json.loads(line[len("data:") :].strip())
-            if handle_envelope(data, t0, full):
+            if handle_envelope(data, t0):
                 return
 
 
 async def run_send(
-    client: httpx.AsyncClient,
-    rpc_url: str,
-    message: dict[str, Any],
-    t0: float,
-    full: bool = False,
+    client: httpx.AsyncClient, rpc_url: str, message: dict[str, Any], t0: float
 ) -> None:
     payload = {
         "jsonrpc": "2.0",
@@ -230,7 +201,7 @@ async def run_send(
     }
     resp = await client.post(rpc_url, json=payload)
     resp.raise_for_status()
-    handle_envelope(resp.json(), t0, full)
+    handle_envelope(resp.json(), t0)
 
 
 def build_message(args: argparse.Namespace) -> dict[str, Any]:
@@ -258,7 +229,7 @@ def build_message(args: argparse.Namespace) -> dict[str, Any]:
     return message
 
 
-async def async_main(base_url: str, message: dict[str, Any], full: bool = False) -> None:
+async def async_main(base_url: str, message: dict[str, Any]) -> None:
     async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, read=60.0)) as client:
         card = await fetch_agent_card(client, base_url)
         print_agent_card_summary(card)
@@ -267,9 +238,9 @@ async def async_main(base_url: str, message: dict[str, Any], full: bool = False)
         t0 = time.monotonic()
         streaming = bool(card.get("capabilities", {}).get("streaming"))
         if streaming:
-            await run_streaming(client, rpc_url, message, t0, full)
+            await run_streaming(client, rpc_url, message, t0)
         else:
-            await run_send(client, rpc_url, message, t0, full)
+            await run_send(client, rpc_url, message, t0)
 
 
 def main() -> None:
@@ -287,17 +258,16 @@ def main() -> None:
     parser.add_argument(
         "--full",
         action="store_true",
-        help=(
-            "Print complete field values instead of truncated previews "
-            "(e.g. chair's full answer text and one verdict per line), "
-            "for inspecting actual output rather than skimming a trace."
-        ),
+        help="Disable preview truncation — print full Part/artifact content",
     )
     args = parser.parse_args()
 
+    global FULL_OUTPUT
+    FULL_OUTPUT = args.full
+
     message = build_message(args)
     try:
-        asyncio.run(async_main(args.url, message, args.full))
+        asyncio.run(async_main(args.url, message))
     except KeyboardInterrupt:
         pass
 
